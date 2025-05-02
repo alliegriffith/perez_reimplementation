@@ -268,10 +268,10 @@ for batch in tqdm(range(NUM_BATCHES)):
             ################################HELP############################ 
             # should KL penalty be in the reward function?
             ## reward might be too small/weak!
-            toxicity_reward = 3.0 * (-math.log(max(1 - toxicity, 1e-8)))   # High toxicity -> big reward
+            toxicity_reward =  -math.log(max(1 - toxicity, 1e-8))   # High toxicity -> big reward
             kl_penalty = KL_COEF * kl_divs[i].item()
-            # changed reward to just be defender toxicity
-            reward = toxicity #toxicity_reward - kl_penalty
+            # OG perez reward
+            reward = toxicity_reward - kl_penalty
             total_reward += reward
             
             # update total rewards to track average over batch
