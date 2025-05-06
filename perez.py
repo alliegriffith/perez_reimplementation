@@ -111,6 +111,7 @@ if not reddit_prompts:
 actor_optimizer = torch.optim.AdamW(adv_model.parameters(), lr=LEARNING_RATE)
 
 
+
 # updated critic and popart def to follow perez's use of popart for the value head
 # PopArt class wraps the critic's value head with PopArt normalization
 class PopArt(nn.Module):
@@ -180,6 +181,7 @@ class Critic(nn.Module):
 critic = Critic().to(critic_device)
 # perez does not mention optimizer for critic, but we will use AdamW with 1e-4 learning rate
 critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=1e-4) 
+wandb.watch([adv_model, critic])
 # critic_optimizer = Adafactor(
 #     critic.parameters(),
 #     lr=1e-4,
@@ -236,14 +238,18 @@ for batch in tqdm(range(NUM_BATCHES)):
             #ref_logits = def_model(full_input_ids.to(defender_device)).logits
 
         # move both logits to the critic device -> KL divergence calc there
-        adv_log_probs_all = F.log_softmax(adv_logits, dim=-1)
-        ref_probs_all = F.softmax(ref_logits, dim=-1).to(actor_device) 
+        adv_probs_all = F.softmax(adv_logits, dim=-1)
+        adv_log_probs_all = F.log_softmax(adv_logits, dim=-1) # [outputLayer, LenOutput, ]
+        #ref_probs_all = F.softmax(ref_logits, dim=-1).to(actor_device) 
         start = prompt_ids.shape[1]
 
         # double check how calc KL divergence - Use HuggingFace’s built-in KL divergence or clip KL values.?
-        kl_divs = (ref_probs_all[:, start:-1, :] *
-                (torch.log(ref_probs_all[:, start:-1, :] + 1e-8) -
-                    adv_log_probs_all[:, start:-1, :])).sum(dim=(1, 2))
+        # kl_divs = (ref_probs_all[:, start:-1, :] *
+        #         (torch.log(ref_probs_all[:, start:-1, :] + 1e-8) -
+        #             adv_log_probs_all[:, start:-1, :])).sum(dim=(1, 2))
+        # proposal distrib is adv and ref distrib is ref
+        kl_divs = (adv_probs_all[:, start:-1, :] * (F.log_softmax(adv_logits, dim =-1)[:, start:-1, :] - 
+                                                    F.log_softmax(ref_logits, dim=-1).to(actor_device)[:, start:-1, :])).sum(dim=(1, 2))
 
 
         # Evaluate defender responses and compute rewards
@@ -257,6 +263,10 @@ for batch in tqdm(range(NUM_BATCHES)):
         # Get log probs for generated tokens - used later for advantages (weight advantages by log probs)
         # log_probs = list of tensors, each of shape (gen_len,), reepping the log-probs of the generated tokens per adv utterance
         prompt_lens = attention_mask.sum(dim=1)  # shape: (batch_size,)
+        print(adv_log_probs_all.shape)
+        print(token_id.shape)
+        print(gen_ids.shape)
+        # allie change this to a gather:
         log_probs = torch.stack([
             torch.stack([
                 adv_log_probs_all[i, prompt_lens[i] + j - 1, token_id]
@@ -315,8 +325,7 @@ for batch in tqdm(range(NUM_BATCHES)):
                     "input_ids": gen_ids[i].unsqueeze(0).to(actor_device),
                     "attention_mask": torch.ones_like(gen_ids[i]).unsqueeze(0).to(actor_device)
                 } # MUST BE SAME SHAPE AS log_probs[i]
-                # okay not moving to critic device becuase should already be on actor/critic device?
-                #critic_inputs = {k: v.to(actor_device) for k, v in critic_inputs.items()}  
+                
                 outputs = adv_model(**critic_inputs, output_hidden_states=True, return_dict=True)
                 # critic predicts value for each token in the adversarial utterance
                 hidden_states = outputs.hidden_states[-1]  # (batch, seq_len, hidden)
@@ -348,11 +357,11 @@ for batch in tqdm(range(NUM_BATCHES)):
             # critic loss is a single value - average of the MSE loss over all tokens - use popart
             critic.value_head.update_stats(target) # should I be calculating critic loss after the batch loop? 
             normalized_target = critic.value_head.normalize(target)
-            normalized_values = critic.value_head.normalize(values)
-            # print("values should be true", values.requires_grad)  # Should be True
+            #normalized_values = critic.value_head.normalize(values)
+            print("values should be true", values.requires_grad)  # Should be True
             # assert values.requires_grad, "values does not require gradients — critic won't be updated!"
 
-            critic_loss += F.mse_loss(normalized_values, normalized_target)
+            critic_loss += F.mse_loss(values, normalized_target)
             # used to use unnormalized values, trying this for stability
             #critic_loss += F.mse_loss(values, normalized_target)
         # trying clipping/normalizing advantages?
@@ -390,7 +399,6 @@ for batch in tqdm(range(NUM_BATCHES)):
             "avg_toxicity_reward": avg_tox_reward,
             "avg_kl_penalty": avg_kl_penalty,
         })
-        wandb.watch([adv_model, critic])
 
         # dev score used by astprompter:  dev_score = sum(rewards)/len(rewards)
         if batch_mean_advantage > adv_best:
