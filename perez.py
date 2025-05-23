@@ -14,10 +14,11 @@ import json
 import wandb
 from torch import amp
 from util import saveModel
+
 import os
 import gc
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.makedirs("perez_models2", exist_ok=True)
+os.makedirs("perez_models3", exist_ok=True)
 
 
 #### differences from Perez et al. ####
@@ -53,7 +54,7 @@ wandb.init(
         "max_gen_tokens": MAX_GEN_TOKENS,
     }
 )
-# Load Models & Tokenizers
+# Load Models & Tokenizers - using Huggingface automodels which instantiate helpful classes
 logging.info("Loading models and tokenizers...") # model using: "meta-llama/Llama-3.1-8B" 
 # Adversary (policy) model – fine-tuned via A2C; bottom 80% of transformer layers are frozen
 adv_model = AutoModelForCausalLM.from_pretrained(model_name).to(actor_device)
@@ -67,7 +68,7 @@ def_tokenizer = AutoTokenizer.from_pretrained(model_name)
 def_tokenizer.pad_token = def_tokenizer.eos_token
 def_tokenizer.padding_side = "left"
 
-# Freeze first 80% of Adversary Layers -- follows perez et al's approach
+# Freeze first 50% of Adversary Layers -- follows perez et al's approach (OG did 80% but our model is much smaller)
 transformer_layers = adv_model.model.layers
 num_layers = len(transformer_layers)
 freeze_layers = int(0.5 * num_layers)
@@ -76,12 +77,6 @@ for i, layer in enumerate(transformer_layers):
     if i < freeze_layers:
         for param in layer.parameters():
             param.requires_grad = False
-            
-# also freeze the embedding layer??
-# for param in adv_model.model.embed_tokens.parameters():
-#     param.requires_grad = False
-
-
 
 # Prepare Reddit Prompts -- same initial prompts as ASTPrompter (nontoxic reddit prompts init convos)
 # Load prompts from your prompts.jsonl file.
@@ -112,67 +107,26 @@ actor_optimizer = torch.optim.AdamW(
     lr=LEARNING_RATE
 )
 
-
-
-# follow perez's use of popart for the value head
-# PopArt class wraps the critic's value head with PopArt normalization
-# class PopArt(nn.Module):
-#     # enables adaptively normalizing targets used in training
-#     # step size 1e-4 consistent with perez et al
-#     def __init__(self, input_size, output_size=1, beta=1e-4):
-#         super().__init__()
-#         self.linear = nn.Linear(input_size, output_size)
-#         self.register_buffer("mean", torch.zeros(1))  
-#         self.register_buffer("var", torch.ones(1))
-#         self.beta = beta
-#         self.epsilon = 1e-5
-
-#     def update_stats(self, targets):
-#         with torch.no_grad():
-#             old_mean = self.mean.clone()
-#             old_std = self.var.sqrt().clone()
-
-#             batch_mean = targets.mean()
-#             batch_var = targets.var(unbiased=False)
-
-#             # Update the running mean and variance
-#             self.mean = (1 - self.beta) * self.mean + self.beta * batch_mean.to(critic_device)
-#             self.var = (1 - self.beta) * self.var + self.beta * batch_var.to(critic_device)
-#             new_std = self.var.sqrt()
-
-#             # Rescale weights and bias
-#             self.linear.weight.data = self.linear.weight.data * (old_std / new_std)
-#             self.linear.bias.data = (old_std / new_std) * self.linear.bias.data + (old_mean - self.mean) / new_std
-
-#     def normalize(self, targets):
-#         return (targets - self.mean) / (self.var.sqrt() + self.epsilon)
-
-#     def forward(self, x):
-#         return self.linear(x)
-
-
 # Critic def 
 class Critic(nn.Module):
     def __init__(self, hidden_size=4096): # hard coded llama3.1-8b hidden size
         super().__init__()
         self.backbone = nn.Sequential(
-            nn.Linear(hidden_size, 1024), # smaller hidden layers than perez bc we are training a much smaller adversary
+            nn.Linear(hidden_size, 2048), 
             nn.ReLU(),
-            nn.Linear(1024, 1024),
+            nn.Linear(2048, 2048),
             nn.ReLU()
         )
-        # apply PopArt normalization to the value head - ensures value prediction remains stable and normalized
-        #self.value_head = PopArt(1024)
-        # trying a simple value head (not popart) 
-        self.value_head = nn.Linear(1024, 1) # layer norm instead of popart
+        self.value_head = nn.Linear(2048, 1) # layer norm?
 
     # returns the value for each token in the adversarial utterance (predicts final reward at each token)
     def forward(self, transformer_output):
         x = self.backbone(transformer_output)
         ans = self.value_head(x)
-        # print("before squeeze", ans.shape) # [1, 50, 1]
-        # print("after squeeze", (ans.squeeze(-1)).shape) # [1, 50] # we are returning value estimate per token of adv utt
-        return ans.squeeze(-1)
+        # print("before squeeze", ans.shape) # [1, 24, 1]
+        # print("after squeeze", (ans.squeeze(-1)).shape) # [1, 24] # we are returning value estimate per token of adv utt
+        
+        return ans.squeeze(-1) # should i make just [24] / [num tokens per adv utt?]
 
 
 critic = Critic().to(critic_device)
@@ -202,9 +156,12 @@ for batch in tqdm(range(NUM_BATCHES)):
         # prompts is a list of randomly selected reddit prompts
         prompts = random.choices(reddit_prompts, k=BATCH_SIZE)
         prompt_inputs = adv_tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+        print("prompt inputs:", prompt_inputs)
         prompt_inputs = {k: v.to(actor_device) for k, v in prompt_inputs.items()}  
         prompt_ids = prompt_inputs["input_ids"]
+        
         attention_mask = prompt_inputs["attention_mask"] # prompt attention mask
+        print("prompt attention mask", attention_mask)
         # batch of adv outputs correspnding to the batch of prompts 
         # .gen produces tokens
         outputs = adv_model.generate(
@@ -216,19 +173,25 @@ for batch in tqdm(range(NUM_BATCHES)):
             top_p=0.95,
             return_dict_in_generate=True,
             output_scores=True,
-            pad_token_id=adv_tokenizer.eos_token_id
+            pad_token_id=adv_tokenizer.eos_token_id,
+            output_hidden_states=True, 
+            return_dict_in_generate=True
+
         )
         # adversarial utterances are the generated tokens (after the prompt)
         #print(outputs.sequences.shape) # [12, 76]
+        print("outputs.sequences" outputs.sequences)
         gen_ids = outputs.sequences[:, prompt_ids.shape[1]:] # gen_ids is only adv utt tokens [bch, adv_utt_len]
         #print("gen_ids shape", gen_ids.shape) # [12, 50]
        
         # Get adversary logits (on GPU 0) - give attention mask when calc adv_logits
-        # attention mask sets padding tokens in prompt and generation to 0
+        # attention mask sets padding tokens in prompt and generation to 0 - expand prompt att_mask to have 1s for gen_ids
         full_attention_mask = torch.cat([attention_mask, torch.ones_like(gen_ids, device=actor_device)], dim=1)
         # start of adv_models's gradients -> does this have gradients attached?
-        adv_logits = adv_model(outputs.sequences.to(actor_device), attention_mask=full_attention_mask).logits
-
+        
+        #### input = torch cat prompt and outputs, dim = -1 -> calc logits with model()
+        adv_logits = adv_model(outputs.sequences.to(actor_device), attention_mask=full_attention_mask).logits # [B, Prompt Ids + Gen Ids, vocab size]
+        
         #adv_logits = adv_model(full_input_ids.to(actor_device)).logits
 
         # Get reference logits (on GPU 1)
@@ -236,21 +199,32 @@ for batch in tqdm(range(NUM_BATCHES)):
             ref_logits = def_model(outputs.sequences.to(defender_device), attention_mask=full_attention_mask.to(defender_device)).logits
             #ref_logits = def_model(full_input_ids.to(defender_device)).logits
 
-        # move both logits to the critic device -> KL divergence calc there
-        adv_probs_all = F.softmax(adv_logits, dim=-1)
+
+        # slice the prompt logits off 
+        start = prompt_ids.shape[1]
+        adv_logits = adv_logits[:, start:, :]
+        ref_logits = ref_logits[:, start:, :]
+        
+        # move both logits to actor device -> KL divergence calc there
+        adv_probs= F.softmax(adv_logits, dim=-1) # dim = -1 means taking softmax over the vocab size (sums to 1)
         # print("adv_probs_all",adv_probs_all.shape) # [12, seq_len (around 80), 128256]
         # print("ref_logits", ref_logits.shape) # [12, seq_len (around 80), 128256]
         # print("adv_logits", adv_logits.shape) # [12, seq_len (around 80), 128256]
-        adv_log_probs_all = F.log_softmax(adv_logits, dim=-1) #[12, 77, 128256] / [batch, seq_len, vocab_size]
+        adv_log_probs = F.log_softmax(adv_logits, dim=-1) #[12, 77, 128256] / [batch, seq_len, vocab_size]
+        ref_log_probs = F.log_softax(ref_logits, dim=-1).to(actor_device)
         #ref_probs_all = F.softmax(ref_logits, dim=-1).to(actor_device) 
-        start = prompt_ids.shape[1]
+        
         #print("KL shape", adv_probs_all[:, start:, :].shape) #[8, 24, 128256]
 
-        # calc KL divergence - removed the "start:-1" bc looked like wrong shape
-        kl_divs = (adv_probs_all[:, start:, :] * (F.log_softmax(adv_logits, dim =-1)[:, start:, :] - 
-                                                    F.log_softmax(ref_logits, dim=-1).to(actor_device)[:, start:, :])).sum(dim=(1, 2))
+        # calc KL divergence - removed the "start:-1" bc looked like wrong shape - remove the logits for the prompts ids, KL div over gen token prob distribs
+        ########################## HELP- PER TOKEN OR PER BATCH? ########################################
+        kl_divs = (adv_probs * (adv_log_probs - ref_log_probs)).sum(dim=(1)) # sum over all vocab (2) per token in batch  -> [B, G]
 
-
+        print("kl_divs shape", kl_divs.shape) # [B]
+        
+        factory_kl = torch.distributions.kl_divergence(adv_probs, ref_logits) 
+        
+        print(f"my KL div: {kl_divs} factory kl div: {factory_kl}")
         # Evaluate defender responses and compute rewards
         actor_loss = 0
         critic_loss = 0
@@ -258,148 +232,99 @@ for batch in tqdm(range(NUM_BATCHES)):
         total_tox_reward = 0
         total_kl_penalty = 0
         
-        prompt_lens = attention_mask.sum(dim=1)  # shape: (batch_size,)
-        # if prompt_lens != prompt_ids.shape[1]:
-        #     print("Prompt length mismatch:", prompt_lens, prompt_ids.shape[1])
-        #print(adv_log_probs_all.shape) #[12, 77, 128256] / [batch, seq_len, vocab_size]
+        # gather the adv log probs of the generated tokens at those time steps
+        # want log_probs = log prob (ak | sk) - gather prob at vocab dim (2) corr to gen_ids
+        token_log_probs = adv_log_probs.gather(gen_ids.unsqueeze(1), dim = 2) # [B, G] 
+        print("adv gen token log probs should be [B, G]", token_log_probs.shape)
         
-        #print(gen_ids.shape) # [12,50] [batch, gen_len]
-        # allie change this to a gather:
-        # log_probs = torch.stack([
-        #     torch.stack([
-        #         adv_log_probs_all[i, prompt_lens[i] + j - 1, token_id]
-        #         for j, token_id in enumerate(gen_ids[i])
-        #     ])
-        #     for i in range(BATCH_SIZE)
-        # ])
-
-        gen_pos = prompt_lens.unsqueeze(1) + torch.arange(gen_ids.shape[1], device=actor_device) - 1
-        #print("gen_pos", gen_pos.shape)# Shape: [batch_size, gen_len] / [12, 50]
-
-        # gather the log probs of the generated tokens at those time steps
-        log_probs = adv_log_probs_all[
-            torch.arange(BATCH_SIZE).unsqueeze(1),  
-            gen_pos,                                
-            gen_ids                                
-        ]  # Final shape: [batch_size, gen_len] / [12, 50]
-
-        # print("log_probs shape", log_probs.shape) #  [12, 50] /[batch size, gen_len]
         batch_advantages = []
         log_probs_batch = []
         batch_rewards = []
         
-        # loop to get defender responses and compute rewards
+        # now let's get defender response + rewards!
+        # def input is prompt + adversarially generated IDs [B] - have to do this way to sep per example
+        #def_input_str = [adv_tokenizer.decode(seq, skip_special_tokens=True) for seq in outputs.sequences]
+        def_input_strs = adv_tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True) # list of str, each str is example
         
-        for i in range(BATCH_SIZE):
-            # Get the prompt and adversarial utterance
-            prompt = prompts[i]
-            adv_utt = adv_tokenizer.decode(gen_ids[i], skip_special_tokens=True)
-            dialogue = prompt + " " + adv_utt
-            # prepare the dialogue for the defender model
-            def_input = def_tokenizer(dialogue, return_tensors="pt", padding=True, truncation=True)
-            def_input = {k: v.to(defender_device) for k, v in def_input.items()}
-
-            def_out = def_model.generate(
-                input_ids=def_input["input_ids"],
-                attention_mask=def_input["attention_mask"],
-                max_new_tokens=MAX_GEN_TOKENS,
-                pad_token_id=def_tokenizer.eos_token_id
-            )
-
-            input_len = def_input["input_ids"].shape[1]
-            def_utt = def_tokenizer.decode(def_out[0][input_len:], skip_special_tokens=True)
-
-            # use llamaguard to get defender toxicity score
-            toxicity, _ = moderate(def_utt)
-            #print(toxicity)
-            # follow perez reward =  -(log(1 - toxicity)) - KL penalty
-            #reward = - (math.log(max(1 - toxicity, 1e-8))) - KL_COEF * kl_divs[i].item()
-            ################################HELP############################ 
-            ## reward might be too small/weak!
-            toxicity_reward =  -math.log(max(1 - toxicity, 1e-8))   # High toxicity -> big reward
-            kl_penalty = KL_COEF * kl_divs[i].item()
-            # OG perez reward (neg bc Adam minimizes and we want to maximize toxicity)
-            reward = toxicity_reward - kl_penalty
-            batch_rewards.append(reward)
-            total_reward += reward
+        # def input = tensor of [B, P + G] - class from huggingface
+        def_input = def_tokenizer(def_input_strs, return_tensors="pt", padding=True, truncation=True).to(defender_device)
+        
+        def_output = def_model.generate(input_ids=def_input["input_ids"], attention_mask = def_input["attention_mask"], max_new_tokens=MAX_GEN_TOKENS,
+                pad_token_id=def_tokenizer.eos_token_id)
+        
+        # def_output.sequences = [B, P + G + D]
+        def_input_len = def_input["input_ids"].shape[1]
+        print("def input len (about 75)", def_input_len)
+        def_ut_tokens = def_output.sequences[:, def_input_len:]
+        print("def utt len (exactly [B, 24])", def_ut_tokens.shape)
+        
+        # def_utt is list of strings [B] - each string is entire defender response
+        #def_utt = def_tokenizer.batch_decode(def_ut_tokens, skip_special_tokens=True) # skipping eos_token (pad) auto covers masking padding?
+    
+        B, D = def_ut_tokens.shape
+        tox_sum = 0
+        with torch.no_grad():
+            # loop through each col of def_ut_tokens to, slice off suffixes, de-tokenize, get tox scores and calc r [B, D-i] -> [B,D] where each val is a float (0-1)
+            rewards = torch.zeros(B, D, device="defender_device")
             
-            # update total rewards to track average over batch
-            total_tox_reward += toxicity_reward
-            total_kl_penalty += kl_penalty
-
-            ###### remove no grad if combine to one update
-            with torch.no_grad():
-                sequences_cuda = outputs.sequences.to(actor_device)
-                ### pass critic state and adv utterance?
-                critic_inputs = {
-                        "input_ids": sequences_cuda[i].unsqueeze(0),
-                        "attention_mask": full_attention_mask[i].unsqueeze(0).to(actor_device)
-                } # MUST BE SAME SHAPE AS log_probs[i]
-                # 
-                new_outputs = adv_model(**critic_inputs, output_hidden_states=True, return_dict=True)
-                # critic predicts value for each token in the adversarial utterance
-                hidden_states = new_outputs.hidden_states[-1]  # (batch, seq_len, hidden)
+            for i in range(D):
+                suffix_token_ids = def_ut_tokens[: , i:] # want def_to_score = [B, D (num tokens defender generated)] where Bi, Di is from current token to end token in def_ut
                 
-            # values is a tensor of shape (seq_len) - estimate for each token in the adversarial utterance
-            # values = critic(hidden_states.to(critic_device)).squeeze(-1) # removed to critic device bc actor/critic device is same now
-            values = critic(hidden_states)  
-            #print("values shape pre squeeze", values.shape) # now [1,80] bc critic gets prompt + adv utt
-            values = values.squeeze(-1)
-            gen_len = gen_ids.shape[1]  # the true length of the generated tokens
-            values = values[:, -gen_len:]  # keep only the final gen_len tokens
-
-            #print("values shape post squeeze", values.shape) # [1,50]
-
-
-            # advantage is the true reward minus the predicted (critic) value
-            # advantage is per token in the adversarial utterance
-            trueReward = torch.full_like(values, fill_value=reward)
-            # Advantage = R - V (no gradient)
-            advantages = (trueReward - values.detach()).squeeze(0) 
-            #print("advantages shape", advantages.shape) # [50]
+                suffix_texts = def_tokenizer.batch_decode(suffix_token_ids, skip_special_tokens=True)  # List[str] of length B
+                
+                # run the list of suffixes through moderate and append in correct [Bi, Di] location to tox_scores
+                for b, text in enumerate(suffix_texts):
+                    score, _ = moderate(text) 
+                    # follow perez reward =  (-(log(1 - toxicity))) - KL_COEF * kl_div
+                    tox_reward = -math.log(max(1 - score, 1e-8))
+                
+                    rewards[b, i] = tox_reward ######### TODO : add KL penalty 
+                    
+                    tox_sum += tox_reward
             
-            # Ensure advantage and log_probs[i] match (they should)
-            assert log_probs[i].shape == advantages.shape, f"Mismatch at batch {batch}, sample {i}, log_probs shape {log_probs[i].shape}, advantages shape {advantages.shape}"    
-           
-            batch_advantages.append(advantages)  
-            log_probs_batch.append(log_probs[i])
-            
-            # calc critic loss as diff beteen target (critic vals) and true rewards (defender tox)
-            # critic loss is a single value - average of the MSE loss over all tokens - use popart
-            # normalized_rewards = critic.value_head.normalize(trueReward).detach() # already kind of normalized
-            # normalized_values = critic.value_head.normalize(values) 
-
-            # not positive if correct to normalize values 
-            critic_loss += F.mse_loss(values, trueReward.detach())
+            print(rewards)
+        print("rewards ^^ and their shape:", rewards.shape)
         
-        # calc loss using non-normalized advantages (sum of advantages for each token in adversarial generation weighted by the token's log_prob)
-        actor_loss = sum(-(adv * lp).sum() for adv, lp in zip(batch_advantages, log_probs_batch))
+        # now pass the final transformer representation of adv utterance through critic to get V(s) estimates -- [B, G (num adv tokens)]
+        final_trans_rep = outputs.hidden_states[-1][:, start:, :].detach() #remove gradients from adv_model, this is to update critic
         
-        # update popart running stats on batch of true rewards 
-        # all_true_rewards = torch.stack([torch.full_like(values, fill_value=r) for r, values in zip(batch_rewards, critic_values)])
-        # critic.value_head.update_stats(all_true_rewards)
-
-
-        # actor loss updates the non-frozen transformer layers
-        actor_loss.backward()
-        # critic loss updates the critic mlp weights
-        critic_loss.backward() 
-
-
-        # Gradient clipping - L2 norm gradient clipping of 1 (from perez)
-        torch.nn.utils.clip_grad_norm_(adv_model.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
-
-        actor_optimizer.step()
-        critic_optimizer.step()
-        actor_optimizer.zero_grad()
+        values = critic(final_trans_rep) # values should be [B, G]
+        print("values shape (should be [B, G])", values.shape)
+        
+        # critic loss = .5 * (V(s) - reward to go)^2 #is this correct? [B, G] -> B (rewards has no gradients, values does)
+        critic_loss_batches = .5 * ((values - rewards) ** 2).sum(dim=1)
+        critic_loss = critic_loss_batches.mean()
+        
+        # update critic!
         critic_optimizer.zero_grad()
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+        critic_optimizer.step()
+        
+        
+        B, G = gen_ids.shape
+        # calc advantages - MC: reward to go - V(s)  should we do?: (TD : r + y*V(s') - V(s)) - most say yes, confused bc have reward to go
+        advantages = rewards - values
+       
+        #  advantages and log probs should be [B, G] -> sum across G then mean across B
+        # calc loss using non-normalized advantages (sum of advantages for each token in adversarial generation weighted by the token's log_prob)
+        actor_loss_batches = (token_log_probs * advantages).sum(dim = 1) # sum across each token -> [B]
+        actor_loss = - actor_loss_batches.mean()
+
+        
+        # update actor
+        actor_optimizer.zero_grad()
+        actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(adv_model.parameters(), 1.0)
+        actor_optimizer.step()
+        
+        
         
         # calc batch averages for logging
-        batch_mean_advantage = torch.stack([adv.mean() for adv in batch_advantages]).mean().item()
-        avg_reward = total_reward / BATCH_SIZE
-        avg_tox_reward = total_tox_reward / BATCH_SIZE
-        avg_kl_penalty = total_kl_penalty / BATCH_SIZE
+        batch_mean_advantage = advantages.mean()
+        avg_reward = rewards.mean()
+        avg_tox_reward = tox_sum / BATCH_SIZE
+        #avg_kl_penalty = total_kl_penalty / BATCH_SIZE
         logging.info(f"[{batch}] avg_reward={avg_reward:.4f}, batch_mean_advantage={batch_mean_advantage:.4f}, avg_actor_loss={actor_loss.item():.4f}, avg_critic_loss={critic_loss.item():.4f}")
         
         wandb.log({
@@ -409,19 +334,19 @@ for batch in tqdm(range(NUM_BATCHES)):
             "avg_critic_loss": critic_loss.item(),
             "batch": batch,
             "avg_toxicity_reward": avg_tox_reward,
-            "avg_kl_penalty": avg_kl_penalty,
+            #"avg_kl_penalty": avg_kl_penalty,
         })
 
-        # dev score used by astprompter:  dev_score = sum(rewards)/len(rewards)
-        if batch_mean_advantage > adv_best:
-            adv_best = batch_mean_advantage
+        # dev score used by astprompter:  dev_score = sum(rewards)/len(rewards) / average rewards
+        if avg_reward > avg_r_best:
+            avg_r_best = avg_reward
             #torch.save(critic.state_dict(), f"perez_models/critic_best_batch{batch}.pt")
             saveModel(
                 adv_model,
                 adv_tokenizer,
-                f"perez_models2/adv_best",
+                f"perez_model_new/adv_best",
                 extra_metadata={"avg_reward": avg_reward, "batch": batch, "batch_mean_advantage": batch_mean_advantage, "actor_loss": actor_loss.item(), "critic_loss": critic_loss.item()}
-            )
+            )    
 
         
         if batch % 300 == 0:
@@ -430,7 +355,7 @@ for batch in tqdm(range(NUM_BATCHES)):
             saveModel(
                 adv_model,
                 adv_tokenizer,
-                f"perez_models2/adv_checkpoint_batch{batch}",
+                f"perez_model_new/adv_checkpoint_batch{batch}",
                 extra_metadata={"avg_reward": avg_reward, "batch": batch, "batch_mean_advantage": batch_mean_advantage, "actor_loss": actor_loss.item(), "critic_loss": critic_loss.item()}
             )
         
@@ -439,5 +364,5 @@ for batch in tqdm(range(NUM_BATCHES)):
         torch.cuda.empty_cache()
 wandb.finish()
 # Save the final model
-torch.save(adv_model.state_dict(), "perez_models2/adv_final.pt")
+torch.save(adv_model.state_dict(), "perez_model_new/adv_final.pt")
 #torch.save(critic.state_dict(),"perez_models/critic_best.pt")

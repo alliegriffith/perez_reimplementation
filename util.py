@@ -20,6 +20,47 @@ def saveModel(model, tokenizer, save_dir, extra_metadata=None):
     tokenizer.save_pretrained(save_dir)
     
     # Save any additional metadata (optional)
-    if extra_metadata is not None:
-        with open(os.path.join(save_dir, "meta.json"), 'w') as f:
-            json.dump(extra_metadata, f, indent=4)
+    # if extra_metadata is not None:
+    #     with open(os.path.join(save_dir, "meta.json"), 'w') as f:
+    #         json.dump(extra_metadata, f, indent=4)
+    
+
+
+
+# follow perez's use of popart for the value head
+# PopArt class wraps the critic's value head with PopArt normalization
+# class PopArt(nn.Module):
+#     # enables adaptively normalizing targets used in training
+#     # step size 1e-4 consistent with perez et al
+#     def __init__(self, input_size, output_size=1, beta=1e-4):
+#         super().__init__()
+#         self.linear = nn.Linear(input_size, output_size)
+#         self.register_buffer("mean", torch.zeros(1))  
+#         self.register_buffer("var", torch.ones(1))
+#         self.beta = beta
+#         self.epsilon = 1e-5
+
+#     def update_stats(self, targets):
+#         with torch.no_grad():
+#             old_mean = self.mean.clone()
+#             old_std = self.var.sqrt().clone()
+
+#             batch_mean = targets.mean()
+#             batch_var = targets.var(unbiased=False)
+
+#             # Update the running mean and variance
+#             self.mean = (1 - self.beta) * self.mean + self.beta * batch_mean.to(critic_device)
+#             self.var = (1 - self.beta) * self.var + self.beta * batch_var.to(critic_device)
+#             new_std = self.var.sqrt()
+
+#             # Rescale weights and bias
+#             self.linear.weight.data = self.linear.weight.data * (old_std / new_std)
+#             self.linear.bias.data = (old_std / new_std) * self.linear.bias.data + (old_mean - self.mean) / new_std
+
+#     def normalize(self, targets):
+#         return (targets - self.mean) / (self.var.sqrt() + self.epsilon)
+
+#     def forward(self, x):
+#         return self.linear(x)
+
+
