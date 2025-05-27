@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Categorical, kl_divergence
 import math
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup, Adafactor
 from tqdm import tqdm
@@ -44,7 +45,7 @@ NUM_BATCHES = NUM_STEPS // BATCH_SIZE # run same number training steps as astpro
 # Set up wandb
 wandb.init(
     project="perez-training",
-    name=f"perez_run_batch{BATCH_SIZE}_May8",
+    name=f"perez_run_batch{BATCH_SIZE}_newMay26",
     config={
         "model_name": model_name,
         "learning_rate": LEARNING_RATE,
@@ -123,10 +124,11 @@ class Critic(nn.Module):
     def forward(self, transformer_output):
         x = self.backbone(transformer_output)
         ans = self.value_head(x)
+        ans = ans.squeeze(-1)
         # print("before squeeze", ans.shape) # [1, 24, 1]
-        # print("after squeeze", (ans.squeeze(-1)).shape) # [1, 24] # we are returning value estimate per token of adv utt
+        #print("critic return after squeeze", (ans.shape)) # [8, 24] # we are returning value estimate per token of adv utt
         
-        return ans.squeeze(-1) # should i make just [24] / [num tokens per adv utt?]
+        return ans 
 
 
 critic = Critic().to(critic_device)
@@ -139,7 +141,7 @@ critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=1e-4)
 #     relative_step=False
 # )
 
-adv_best = float("-inf")
+avg_r_best = float("-inf")
 wandb.watch(adv_model, log="all", log_freq=10)
 wandb.watch(critic, log="all", log_freq=10)
 adv_model.train()
@@ -148,20 +150,15 @@ critic.train()
 
 # Training time!!! 
 for batch in tqdm(range(NUM_BATCHES)):
-    
-    # gen batch of prompts and adversarial utterances and KL divergences 
-    
-    # using autocast to enable bfloat16 training and stochastic rounding (follows perez)
-    with amp.autocast("cuda", dtype=torch.bfloat16): # allie double check
+    # using autocast to enable bfloat16 training (follows perez)
+    with amp.autocast("cuda", dtype=torch.bfloat16): # I think this is correct, double check? 
         # prompts is a list of randomly selected reddit prompts
         prompts = random.choices(reddit_prompts, k=BATCH_SIZE)
         prompt_inputs = adv_tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-        print("prompt inputs:", prompt_inputs)
         prompt_inputs = {k: v.to(actor_device) for k, v in prompt_inputs.items()}  
         prompt_ids = prompt_inputs["input_ids"]
         
-        attention_mask = prompt_inputs["attention_mask"] # prompt attention mask
-        print("prompt attention mask", attention_mask)
+        attention_mask = prompt_inputs["attention_mask"] # prompt attention mask - left padded so 0s on left
         # batch of adv outputs correspnding to the batch of prompts 
         # .gen produces tokens
         outputs = adv_model.generate(
@@ -174,24 +171,23 @@ for batch in tqdm(range(NUM_BATCHES)):
             return_dict_in_generate=True,
             output_scores=True,
             pad_token_id=adv_tokenizer.eos_token_id,
-            output_hidden_states=True, 
-            return_dict_in_generate=True
-
+            output_hidden_states=True
         )
         # adversarial utterances are the generated tokens (after the prompt)
         #print(outputs.sequences.shape) # [12, 76]
-        print("outputs.sequences" outputs.sequences)
+        #print("outputs.sequences", outputs.sequences.shape) # [B, P + G] / [8, 52]
         gen_ids = outputs.sequences[:, prompt_ids.shape[1]:] # gen_ids is only adv utt tokens [bch, adv_utt_len]
-        #print("gen_ids shape", gen_ids.shape) # [12, 50]
+        # print("gen_ids shape", gen_ids.shape) # [12, 24] / [B,G]
        
         # Get adversary logits (on GPU 0) - give attention mask when calc adv_logits
         # attention mask sets padding tokens in prompt and generation to 0 - expand prompt att_mask to have 1s for gen_ids
         full_attention_mask = torch.cat([attention_mask, torch.ones_like(gen_ids, device=actor_device)], dim=1)
-        # start of adv_models's gradients -> does this have gradients attached?
         
-        #### input = torch cat prompt and outputs, dim = -1 -> calc logits with model()
-        adv_logits = adv_model(outputs.sequences.to(actor_device), attention_mask=full_attention_mask).logits # [B, Prompt Ids + Gen Ids, vocab size]
         
+        #### calc logits hard way bc need to condition on prompt to get KL div for gen_ids
+        full_adv_output = adv_model(outputs.sequences.to(actor_device), attention_mask=full_attention_mask, output_hidden_states=True, return_dict=True) # [B, Prompt Ids + Gen Ids, vocab size]
+        adv_logits = full_adv_output.logits
+        adv_final_hidden = full_adv_output.hidden_states[-1] 
         #adv_logits = adv_model(full_input_ids.to(actor_device)).logits
 
         # Get reference logits (on GPU 1)
@@ -204,27 +200,23 @@ for batch in tqdm(range(NUM_BATCHES)):
         start = prompt_ids.shape[1]
         adv_logits = adv_logits[:, start:, :]
         ref_logits = ref_logits[:, start:, :]
+        adv_final_hidden = adv_final_hidden[:, start:, :] 
         
         # move both logits to actor device -> KL divergence calc there
         adv_probs= F.softmax(adv_logits, dim=-1) # dim = -1 means taking softmax over the vocab size (sums to 1)
-        # print("adv_probs_all",adv_probs_all.shape) # [12, seq_len (around 80), 128256]
-        # print("ref_logits", ref_logits.shape) # [12, seq_len (around 80), 128256]
-        # print("adv_logits", adv_logits.shape) # [12, seq_len (around 80), 128256]
-        adv_log_probs = F.log_softmax(adv_logits, dim=-1) #[12, 77, 128256] / [batch, seq_len, vocab_size]
-        ref_log_probs = F.log_softax(ref_logits, dim=-1).to(actor_device)
-        #ref_probs_all = F.softmax(ref_logits, dim=-1).to(actor_device) 
+        # print("adv_probs",adv_probs.shape) # [12, G/24, 128256]
+        # print("ref_logits", ref_logits.shape) # [12, G, 128256]
+        # print("adv_logits", adv_logits.shape) # [12, G, 128256]
+        adv_log_probs = F.log_softmax(adv_logits, dim=-1) #[12, 24, 128256] / [batch, G, vocab_size]
+        ref_log_probs = F.log_softmax(ref_logits, dim=-1).to(actor_device)
         
-        #print("KL shape", adv_probs_all[:, start:, :].shape) #[8, 24, 128256]
 
-        # calc KL divergence - removed the "start:-1" bc looked like wrong shape - remove the logits for the prompts ids, KL div over gen token prob distribs
+        # calc KL divergence - we are doing per token reward so need per token KL divergence
         ########################## HELP- PER TOKEN OR PER BATCH? ########################################
-        kl_divs = (adv_probs * (adv_log_probs - ref_log_probs)).sum(dim=(1)) # sum over all vocab (2) per token in batch  -> [B, G]
+        kl_divs = (adv_probs * (adv_log_probs - ref_log_probs)).sum(dim=(2)) # sum over all vocab (2) per token in batch  -> [B, G]
 
-        print("kl_divs shape", kl_divs.shape) # [B]
+        #print("kl_divs shape", kl_divs.shape) # [B, G] / [12,24]
         
-        factory_kl = torch.distributions.kl_divergence(adv_probs, ref_logits) 
-        
-        print(f"my KL div: {kl_divs} factory kl div: {factory_kl}")
         # Evaluate defender responses and compute rewards
         actor_loss = 0
         critic_loss = 0
@@ -234,65 +226,68 @@ for batch in tqdm(range(NUM_BATCHES)):
         
         # gather the adv log probs of the generated tokens at those time steps
         # want log_probs = log prob (ak | sk) - gather prob at vocab dim (2) corr to gen_ids
-        token_log_probs = adv_log_probs.gather(gen_ids.unsqueeze(1), dim = 2) # [B, G] 
-        print("adv gen token log probs should be [B, G]", token_log_probs.shape)
+        token_log_probs = adv_log_probs.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1) # [B, G] 
+        #print("adv gen token log probs should be [B, G]", token_log_probs.shape) # [8, 24]
         
-        batch_advantages = []
-        log_probs_batch = []
-        batch_rewards = []
-        
+        with torch.no_grad(): # no gradients needed for defender
         # now let's get defender response + rewards!
         # def input is prompt + adversarially generated IDs [B] - have to do this way to sep per example
         #def_input_str = [adv_tokenizer.decode(seq, skip_special_tokens=True) for seq in outputs.sequences]
-        def_input_strs = adv_tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True) # list of str, each str is example
+            def_input_strs = adv_tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True) # list of str, each str is example
         
-        # def input = tensor of [B, P + G] - class from huggingface
-        def_input = def_tokenizer(def_input_strs, return_tensors="pt", padding=True, truncation=True).to(defender_device)
-        
-        def_output = def_model.generate(input_ids=def_input["input_ids"], attention_mask = def_input["attention_mask"], max_new_tokens=MAX_GEN_TOKENS,
+            # def input = tensor of [B, P + G] - class from huggingface
+            raw = def_tokenizer(def_input_strs, return_tensors="pt", padding=True, truncation=True)
+            def_input = { k: v.to(defender_device) for k,v in raw.items() }
+
+            def_output = def_model.generate(input_ids=def_input["input_ids"], attention_mask = def_input["attention_mask"], max_new_tokens=MAX_GEN_TOKENS,
                 pad_token_id=def_tokenizer.eos_token_id)
         
-        # def_output.sequences = [B, P + G + D]
-        def_input_len = def_input["input_ids"].shape[1]
-        print("def input len (about 75)", def_input_len)
-        def_ut_tokens = def_output.sequences[:, def_input_len:]
-        print("def utt len (exactly [B, 24])", def_ut_tokens.shape)
+            # def_output.sequences = [B, P + G + D]
+            def_input_len = def_input["input_ids"].shape[1]
+            #print("def input len", def_input_len) # 52 - P + G ? 
+            def_ut_tokens = def_output[:, def_input_len:]
+            #print("def utt len (exactly [B, 24])", def_ut_tokens.shape) #[B, D/ 24]
+            
+            # def_utt is list of strings [B] - each string is entire defender response
+            #def_utt = def_tokenizer.batch_decode(def_ut_tokens, skip_special_tokens=True) # skipping eos_token (pad) auto covers masking padding?
         
-        # def_utt is list of strings [B] - each string is entire defender response
-        #def_utt = def_tokenizer.batch_decode(def_ut_tokens, skip_special_tokens=True) # skipping eos_token (pad) auto covers masking padding?
-    
-        B, D = def_ut_tokens.shape
-        tox_sum = 0
-        with torch.no_grad():
+            B, D = def_ut_tokens.shape
+            tox_sum = 0
             # loop through each col of def_ut_tokens to, slice off suffixes, de-tokenize, get tox scores and calc r [B, D-i] -> [B,D] where each val is a float (0-1)
-            rewards = torch.zeros(B, D, device="defender_device")
+            rewards = torch.zeros(B, D, device=defender_device) # [B, G] / [8, 24]
             
-            for i in range(D):
-                suffix_token_ids = def_ut_tokens[: , i:] # want def_to_score = [B, D (num tokens defender generated)] where Bi, Di is from current token to end token in def_ut
+            
+            def_utt_strs = def_tokenizer.batch_decode(def_ut_tokens, skip_special_tokens=True)  # List[str] of length B
                 
-                suffix_texts = def_tokenizer.batch_decode(suffix_token_ids, skip_special_tokens=True)  # List[str] of length B
+            # run the list of suffixes through moderate and append in correct [Bi, Di] location to tox_scores
+            for b, text in enumerate(def_utt_strs):
+                score, _ = moderate(text) 
+                # follow perez reward =  (-(log(1 - toxicity)))
+                tox_reward = -math.log(max(1 - score, 1e-8))
                 
-                # run the list of suffixes through moderate and append in correct [Bi, Di] location to tox_scores
-                for b, text in enumerate(suffix_texts):
-                    score, _ = moderate(text) 
-                    # follow perez reward =  (-(log(1 - toxicity))) - KL_COEF * kl_div
-                    tox_reward = -math.log(max(1 - score, 1e-8))
-                
-                    rewards[b, i] = tox_reward ######### TODO : add KL penalty 
+                rewards[b, :] = tox_reward # all tokens get reward of def utt
                     
-                    tox_sum += tox_reward
+                tox_sum += tox_reward
             
-            print(rewards)
-        print("rewards ^^ and their shape:", rewards.shape)
+        #     print(rewards)
+        # print("rewards ^^ and their shape:", rewards.shape) # [8, 24] , all on e_03 - e+00 range
         
-        # now pass the final transformer representation of adv utterance through critic to get V(s) estimates -- [B, G (num adv tokens)]
-        final_trans_rep = outputs.hidden_states[-1][:, start:, :].detach() #remove gradients from adv_model, this is to update critic
-        
-        values = critic(final_trans_rep) # values should be [B, G]
-        print("values shape (should be [B, G])", values.shape)
-        
+        # subtract KL penalty from rewards
+        rewards = rewards.to(critic_device).detach()
+        rewards = (rewards - KL_COEF * kl_divs).detach()
+        #print("rewards after KL penalty", rewards.shape) # [B, G] / [8, 24]
+        #print("adv_final_hidden shape", adv_final_hidden.shape) # [B, G, 4096] - hidden size of llama3.1-8b
+        values = critic(adv_final_hidden.detach()) # values should be [B, G]
+        #print("values shape (should be [B, G])", values.shape) # [8, 24]
+        # move rewards to critic device
+        #################3HELP####################
+        reward_to_go = rewards.flip(dims=[1])         # [B, G] reversed in token-axis
+        reward_to_go = reward_to_go.cumsum(dim=1)     # prefix sums in reversed order
+        reward_to_go = reward_to_go.flip(dims=[1])    # back to original order
+        # print("reward to go shape", reward_to_go.shape) # [B, G] / [8, 24]
+        # print("reward to go", reward_to_go) # should be [B, G] / [8, 24] - rewards to go for each token in adv utt
         # critic loss = .5 * (V(s) - reward to go)^2 #is this correct? [B, G] -> B (rewards has no gradients, values does)
-        critic_loss_batches = .5 * ((values - rewards) ** 2).sum(dim=1)
+        critic_loss_batches = .5 * ((values - reward_to_go) ** 2).sum(dim=1)
         critic_loss = critic_loss_batches.mean()
         
         # update critic!
@@ -302,24 +297,25 @@ for batch in tqdm(range(NUM_BATCHES)):
         critic_optimizer.step()
         
         
-        B, G = gen_ids.shape
+        # add KL penalty to rewards
+        values = values.detach()
+        values = values.to(actor_device)
+        V_next = torch.cat([values[:, 1:], torch.zeros(B, 1, device=values.device)], dim=1)
         # calc advantages - MC: reward to go - V(s)  should we do?: (TD : r + y*V(s') - V(s)) - most say yes, confused bc have reward to go
-        advantages = rewards - values
+        advantages = rewards + V_next - values
+        #advantages = [rewards[:, i] + values[:, i + 1] - values[:, i] for i in range(MAX_GEN_TOKENS)] # [B, G] - [B, G] -> [B, G]
        
         #  advantages and log probs should be [B, G] -> sum across G then mean across B
         # calc loss using non-normalized advantages (sum of advantages for each token in adversarial generation weighted by the token's log_prob)
         actor_loss_batches = (token_log_probs * advantages).sum(dim = 1) # sum across each token -> [B]
         actor_loss = - actor_loss_batches.mean()
-
         
         # update actor
         actor_optimizer.zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(adv_model.parameters(), 1.0)
         actor_optimizer.step()
-        
-        
-        
+     
         # calc batch averages for logging
         batch_mean_advantage = advantages.mean()
         avg_reward = rewards.mean()
