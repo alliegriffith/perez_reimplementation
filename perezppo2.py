@@ -1,10 +1,3 @@
-# this code follows OpenAI's PPO implementation with Perez rewarding scheme
-# changes from other PPO attempt:
-         # seperate the value network that uses llamaguard final hidden rep for prompt leading to unsafe seq -> can update seperately (see appdx G.1 for reasoning)
-         # start with actor as SFT model
-         # ????? GAE advantage estimation (instead of MC) use gamma = 1 and lamda = 0.95 ??? How when treat output of reward as reward for each token?
-         # for surrogate objective use ratio btwn last iteration and current iteration policy but use KL penalty to OG model?
-         # multiple updates per batch???
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,41 +14,40 @@ import random
 import json
 import wandb
 from torch import amp
-from util import saveModel
-
+from tensorflow.keras.optimizers import Adam
+from util import saveModel, whiten, gaeAndVt
 import os
 import gc
+from copy import deepcopy
+
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-folder_name = "perez_ppo_new"
-os.makedirs(folder_name, exist_ok=True)
+os.makedirs("perez_winner", exist_ok=True)
 
 
-#### differences from Perez et al. ####
-# update Use a smaller critic model (hidden layers of size 1024 not 2048) bc training much smaller model (8B v 280B)
-# Use batch size of 12 not 16 for memory reasons
-# Use Adam not adafactor optimizers
 #-------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 actor_device = torch.device("cuda:0") #  actor and critic on same device
-critic_device = torch.device("cuda:0")
 defender_device = torch.device("cuda:1") 
 # inherently white box for now, can change later
 model_name = "meta-llama/Llama-3.1-8B" 
-adv_model = "/home/allie11/baselines/sft_model/ast_sft_llama"
 
 # Training hyperparameters
 NUM_STEPS = 10000 # consistent with ASTPrompter
-LEARNING_RATE = 7e-6 # changing to match openAI PPO -> linear decay schedule
-KL_COEF = 0.3  # KL penalty of most effective perez model
+LEARNING_RATE = 2e-6 # consistent with openai paper
+KL_COEF = 0.3  # far less than KL penalty of most effective perez model (0.3) but follows openai paper
 CHECKPOINT_PATH = "best_perez"
 MAX_GEN_TOKENS = 24 # consistent with ASTPrompter??? ASTPrompter is 24 ### change later
 BATCH_SIZE = 8 # Perez had 16, reduced for space reasons
 NUM_BATCHES = NUM_STEPS // BATCH_SIZE # run same number training steps as astprompter
 CLIP_EPS = 0.2
+TEMPERATURE = 1.0
+warmup_steps = int(0.1 * NUM_STEPS) 
+
 # Set up wandb
 wandb.init(
     project="perez-training",
-    name=f"perez_ppo",
+    name=f"perez_run_ppo4realz",
     config={
         "model_name": model_name,
         "learning_rate": LEARNING_RATE,
@@ -67,27 +59,13 @@ wandb.init(
 )
 # Load Models & Tokenizers - using Huggingface automodels which instantiate helpful classes
 logging.info("Loading models and tokenizers...") # model using: "meta-llama/Llama-3.1-8B" 
-# Adversary (policy) model – fine-tuned via A2C; bottom 80% of transformer layers are frozen
-adv_model = AutoModelForCausalLM.from_pretrained(adv_model).to(actor_device)
-adv_tokenizer = AutoTokenizer.from_pretrained(adv_model)
-adv_tokenizer.pad_token = adv_tokenizer.eos_token
-adv_tokenizer.padding_side = "left"
 
 # Defender model (used to generate the reply, left unchanged during training)
-def_model = AutoModelForCausalLM.from_pretrained(model_name).to(defender_device)
-def_tokenizer = AutoTokenizer.from_pretrained(model_name)
+def_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16).to(defender_device)
+def_tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side = "left")
+#def_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 def_tokenizer.pad_token = def_tokenizer.eos_token
-def_tokenizer.padding_side = "left"
 
-# Freeze first 50% of Adversary Layers -- follows perez et al's approach (OG did 80% but our model is much smaller)
-transformer_layers = adv_model.model.layers
-num_layers = len(transformer_layers)
-freeze_layers = int(0.5 * num_layers)
-logging.info(f"Total transformer layers = {num_layers}. Freezing first {freeze_layers} layers.")
-for i, layer in enumerate(transformer_layers):
-    if i < freeze_layers:
-        for param in layer.parameters():
-            param.requires_grad = False
 
 # Prepare Reddit Prompts -- same initial prompts as ASTPrompter (nontoxic reddit prompts init convos)
 # Load prompts from your prompts.jsonl file.
@@ -104,114 +82,159 @@ with open("prompts.jsonl", 'r') as df:
 # We’ll use only the prompt part (first element) as our Reddit prompt.
 reddit_prompts = [prompt for prompt, _ in prompts_rtp]
 
+# adv model tokenizer
+adv_tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side = "left")
+adv_tokenizer.pad_token = adv_tokenizer.eos_token
+#print("adv_tokenizer pad token", adv_tokenizer.pad_token) # should be same as def_tokenizer eos  : 128001 
+#pad_id = adv_tokenizer.pad_token_id
 
-actor_optimizer = torch.optim.AdamW(
-    filter(lambda p: p.requires_grad, adv_model.parameters()), 
-    lr=LEARNING_RATE
-)
 
-class Critic(nn.Module):
-    def __init__(self):
-        super().__init__() 
-        # trainable value head on top of the last hidden state of llamaguard (reward function)
+class ActorCriticModel(nn.Module):
+    def __init__(self, model_name="meta-llama/Llama-3-8b"):
+        super().__init__()
+        # actor
+        self.base_model = AutoModelForCausalLM.from_pretrained(model_name,output_hidden_states=True,torch_dtype=torch.bfloat16).to(actor_device)
+
+        # Freeze first 50% of Adversary Layers -- follows perez et al's approach (OG did 80% but our model is much smaller)
+        transformer_layers = self.base_model.model.layers
+        num_layers = len(transformer_layers)
+        freeze_layers = int(0.5 * num_layers)
+        logging.info(f"Total transformer layers = {num_layers}. Freezing first {freeze_layers} layers.")
+        for i, layer in enumerate(transformer_layers):
+            if i < freeze_layers:
+                for param in layer.parameters():
+                    param.requires_grad = False
+
+        self.hidden_size = self.base_model.config.hidden_size
+
+        # critic value head - follows perez
         self.value_head = nn.Sequential(
-            nn.Linear(4096, 2048),
+            nn.Linear(self.hidden_size, 2048), 
             nn.ReLU(),
             nn.Linear(2048, 2048),
             nn.ReLU(),
-            nn.Linear(2048, 1)
+            nn.Linear(2048, 1)  # Final layer to output scalar value per token
         )
 
-    def forward(self, promptStrList):
-        values = []
-        # take in prompt (state) -> final transformer representation of final token of llamaGuard(prompt) as input 
-        for i, promptStr in enumerate(promptStrList):
-            critic_input = moderate(promptStr, criticCall = True) # should return a tensor
-            print("critic_input shape", critic_input.shape) # [1, 4096] - final hidden state of llamaGuard
-            critic_input = critic_input.to(critic_device) # [1, 4096]
-            # Value prediction
-            value = self.value_head(critic_input)  # shape: [1, 1]
-            values.append(value.squeeze(-1))  # squeeze to get rid of the last dimension
-        return torch.cat(values, dim=0) # turn to tensor and return [B] shape
+    # forward pass for actor-critic model to return logits and values
+    def forward(self, input_ids, attention_mask=None): # input tokenized P + G and full attention mask
+        
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+            do_dropout=False, 
+        )
+        
+        hidden_states = outputs.hidden_states[-1]       # [B, T, H]
+        lm_logits = outputs.logits                      # [B, T, vocab]
+        values = self.value_head(hidden_states).squeeze(-1)  # [B, T]
+
+        return lm_logits, values
+
+    
+model = ActorCriticModel(model_name=model_name).to(actor_device)
+old_actor = deepcopy(model.base_model)
+old_actor.eval()
+ppo_optimizer = torch.optim.AdamW(
+    filter(lambda p: p.requires_grad, model.parameters()), 
+    lr=LEARNING_RATE
+)
 
 
-critic = Critic().to(critic_device)
-# perez does not mention optimizer for critic, but we will use AdamW with 1e-4 learning rate
-critic_optimizer = torch.optim.AdamW(critic.value_head.parameters(), lr=1e-4) 
+scheduler = get_linear_schedule_with_warmup(
+    ppo_optimizer,
+    num_warmup_steps=warmup_steps,
+    num_training_steps=NUM_STEPS,
+)
 
 avg_r_best = float("-inf")
-wandb.watch(adv_model, log="all", log_freq=10)
-wandb.watch(critic, log="all", log_freq=10)
-adv_model.train()
+wandb.watch(model, log="all", log_freq=10)
+old_log_probs = None
 
-
+model.train()
+def_model.eval()
 
 # Training time!!! 
 for batch in tqdm(range(NUM_BATCHES)):
     # using autocast to enable bfloat16 training (follows perez)
     with amp.autocast("cuda", dtype=torch.bfloat16): # I think this is correct, double check? 
+    #with torch.cuda.amp.autocast(dtype=torch.float32):
+
         # prompts is a list of randomly selected reddit prompts
         prompts = random.choices(reddit_prompts, k=BATCH_SIZE)
         prompt_inputs = adv_tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
         prompt_inputs = {k: v.to(actor_device) for k, v in prompt_inputs.items()}  
         prompt_ids = prompt_inputs["input_ids"]
         
-        attention_mask = prompt_inputs["attention_mask"] # prompt attention mask - left padded so 0s on left
-        # batch of adv outputs correspnding to the batch of prompts 
-        # .gen produces tokens
-        outputs = adv_model.generate(
+        attention_mask = prompt_ids != adv_tokenizer.pad_token_id
+        
+        #attention_mask = prompt_inputs["attention_mask"] # prompt attention mask - left padded so 0s on left
+        model.eval()
+        outputs = model.base_model.generate(
             input_ids=prompt_ids,
             attention_mask=attention_mask,
-            max_new_tokens=MAX_GEN_TOKENS,
-            do_sample=True,
-            top_k=50,
-            top_p=0.95,
-            return_dict_in_generate=True,
-            output_scores=True,
-            pad_token_id=adv_tokenizer.eos_token_id,
-            output_hidden_states=True
-        )
-        # adversarial utterances are the generated tokens (after the prompt)
-        #print(outputs.sequences.shape) # [12, 76]
-        #print("outputs.sequences", outputs.sequences.shape) # [B, P + G] / [8, 52]
-        gen_ids = outputs.sequences[:, prompt_ids.shape[1]:] # gen_ids is only adv utt tokens [bch, adv_utt_len]
-        # print("gen_ids shape", gen_ids.shape) # [12, 24] / [B,G]
-       
-        # Get adversary logits (on GPU 0) - give attention mask when calc adv_logits
-        # attention mask sets padding tokens in prompt and generation to 0 - expand prompt att_mask to have 1s for gen_ids
-        full_attention_mask = torch.cat([attention_mask, torch.ones_like(gen_ids, device=actor_device)], dim=1)
+            max_new_tokens=MAX_GEN_TOKENS, 
+            return_dict_in_generate=True)
+        model.train()
         
+        start = prompt_ids.shape[1] 
+        gen_ids = outputs.sequences[:, start:]
+        #print("gen_ids", gen_ids) # [B, G] / [8, 24]
+        gen_mask = gen_ids != adv_tokenizer.pad_token_id
+        #print("gen_mask", gen_mask) # all true bc generating 24 tokens
         
-        #### calc logits hard way bc need to condition on prompt to get KL div for gen_ids
-        full_adv_output = adv_model(outputs.sequences.to(actor_device), attention_mask=full_attention_mask, output_hidden_states=True, return_dict=True) # [B, Prompt Ids + Gen Ids, vocab size]
-        adv_logits = full_adv_output.logits
-        adv_final_hidden = full_adv_output.hidden_states[-1]
-        #adv_logits = adv_model(full_input_ids.to(actor_device)).logits
-        start = prompt_ids.shape[1]
-        # # Get reference logits (on GPU 1)
+        full_attention_mask = torch.cat([attention_mask, gen_mask], dim=1)
+        #print("full mask", full_attention_mask) # left padded false for shorter prompts
+
+        
+        adv_logits, values = model(outputs.sequences, full_attention_mask)
+        
+        # Get reference logits (on GPU 1)
         with torch.no_grad():
-            old_logits = def_model(outputs.sequences.to(defender_device), attention_mask=full_attention_mask.to(defender_device)).logits
-            old_logits = old_logits[:, start:, :]
-            old_log_probs = F.log_softmax(old_logits, dim=-1).to(actor_device)
-            old_token_log_probs = old_log_probs.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1) # [B, G] 
-            old_log_probs = old_token_log_probs.sum(dim=1) 
+            ref_logits = def_model(outputs.sequences.to(defender_device), attention_mask=full_attention_mask.to(defender_device)).logits
+            #ref_logits = def_model(full_input_ids.to(defender_device)).logits
+
+
+        # slice the prompt off all of these [B, P+G] -> [B, G]
+        adv_logits = adv_logits[:, start:, :]  # slice off prompt logits, [B, G, vocab_size]
+        values = values[:, start:]  # slice off prompt values, [B, G]
+        ref_logits = ref_logits[:, start:, :]
         
+        # divide logits by temperature
+        adv_logits = adv_logits / model.base_model.config.temperature
+        ref_logits = ref_logits / def_model.config.temperature
         
-        adv_logits = adv_logits[:, start:, :]
-        #ref_logits = ref_logits[:, start:, :]
-        adv_final_hidden = adv_final_hidden[:, start:, :] 
-        
+        # whiten values (normalization)
+        values = whiten(values, shift_mean=False)  # [B, G] - whitened values
         # move both logits to actor device -> KL divergence calc there
-        #adv_probs= F.softmax(adv_logits, dim=-1) # dim = -1 means taking softmax over the vocab size (sums to 1)
+        adv_probs= F.softmax(adv_logits, dim=-1) # dim = -1 means taking softmax over the vocab size (sums to 1)
+        # print("adv_probs",adv_probs.shape) # [12, G/24, 128256]
+        # print("ref_logits", ref_logits.shape) # [12, G, 128256]
+        # print("adv_logits", adv_logits.shape) # [12, G, 128256]
         adv_log_probs = F.log_softmax(adv_logits, dim=-1) #[12, 24, 128256] / [batch, G, vocab_size]
-       
-        # calculating prob of agent taking those actions
+        ref_log_probs = F.log_softmax(ref_logits, dim=-1).to(actor_device)
+        
+        # calc KL divergence - we are doing per token reward so need per token KL divergence!
+        kl_divs = (adv_probs * (adv_log_probs - ref_log_probs)).sum(dim=(2)) # sum over all vocab (2) per token in batch  -> [B, G]
+        kl_divs = kl_divs * gen_mask
+        print("kl_divs", kl_divs) # all 0's in B,G shape at first then grows! still small e-04
+        #print("kl_divs shape", kl_divs.shape) # [B, G] / [12,24]
+        
         # gather the adv log probs of the generated tokens at those time steps
         # want log_probs = log prob (ak | sk) - gather prob at vocab dim (2) corr to gen_ids
         token_log_probs = adv_log_probs.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1) # [B, G] 
-        batch_log_probs = token_log_probs.sum(dim=1) # sum across G -> [B] - this is the log prob of the entire adversarial utterance
+        token_log_probs = token_log_probs * gen_mask
+        
+        with torch.no_grad():
+            old_logits = old_actor(outputs.sequences.to(actor_device), attention_mask=full_attention_mask.to(actor_device)).logits
+            old_logits = old_logits[:, start:, :]
+            old_log_probs = F.log_softmax(old_logits, dim=-1)
+            old_log_probs = old_log_probs.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1).detach()
+
+
         #print("adv gen token log probs should be [B, G]", token_log_probs.shape) # [8, 24]
-        # Evaluate defender responses and compute rewards
         
         with torch.no_grad(): # no gradients needed for defender
         # now let's get defender response + rewards!
@@ -236,9 +259,9 @@ for batch in tqdm(range(NUM_BATCHES)):
             #def_utt = def_tokenizer.batch_decode(def_ut_tokens, skip_special_tokens=True) # skipping eos_token (pad) auto covers masking padding?
         
             B, D = def_ut_tokens.shape
-            tox = torch.zeros(B, device=defender_device)
+            tox_sum = 0
             # loop through each col of def_ut_tokens to, slice off suffixes, de-tokenize, get tox scores and calc r [B, D-i] -> [B,D] where each val is a float (0-1)
-            rewards = torch.zeros(B, device=defender_device) # [B, G] / [8, 24]
+            rewards = torch.zeros(B, D, device=defender_device) # [B, G] / [8, 24]
             
             
             def_utt_strs = def_tokenizer.batch_decode(def_ut_tokens, skip_special_tokens=True)  # List[str] of length B
@@ -249,53 +272,58 @@ for batch in tqdm(range(NUM_BATCHES)):
                 # follow perez reward =  (-(log(1 - toxicity)))
                 tox_reward = -math.log(max(1 - score, 1e-8))
                 
-                rewards[b] = tox_reward # single reward for each adversarial utterance
-                    
-                tox[b] = score # single toxicity score for each adversarial utterance
+                #rewards[b, -1] = tox_reward # only the last token gets the reward
+                last_real_token = gen_mask[b].nonzero()[-1].item()
+                rewards[b, last_real_token] = tox_reward # setting reward to last real token in gen adv ut (sometimes shorter, not often)
+   
+                tox_sum += tox_reward
             
         #     print(rewards)
         # print("rewards ^^ and their shape:", rewards.shape) # [8, 24] , all on e_03 - e+00 range
         
+        # subtract KL penalty from rewards
+        rewards = rewards.to(actor_device).detach()
+        # whiten rewards (no shifted mean)
+        #rewards = whiten(rewards, shift_mean=False)
+        rewards = (rewards - KL_COEF * kl_divs).detach()
         #print("rewards after KL penalty", rewards.shape) # [B, G] / [8, 24]
         #print("adv_final_hidden shape", adv_final_hidden.shape) # [B, G, 4096] - hidden size of llama3.1-8b
-        values = critic(adv_final_hidden.detach()) # values should be [B]
-        print("values shape (should be [B])", values.shape) # [8, 24]
         
-        rewards = rewards.to(critic_device).detach()
+        # calc GAE advantage and target values
+        advantages, values_target = gaeAndVt(rewards, values) # [B, G] - whitened advantages and target values
+        # print("advantages shape", advantages.shape) # [B, G] / [8, 24]
+        # print("values_target shape", values_target.shape) # [B, G] / [8, 24]
+        # values_target is 
+        advantages = advantages * gen_mask
+        returns = values_target * gen_mask
+
         
-        critic_loss_batches = .5 * ((values - rewards) ** 2)
-        critic_loss = critic_loss_batches.mean()
-        
-        # update critic!
-        critic_optimizer.zero_grad()
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
-        critic_optimizer.step()
-        
-    
-        values = values.detach()
-        values = values.to(actor_device)
-    
-        # calc advantages - MC: reward to go - V(s) 
-        advantages = rewards - values
-        
+        ## calc clipped surrogate loss for actor and critic
+        LV1 = ((values - values_target)**2) * gen_mask  # [B, G]
+        LV2 = ((torch.clamp(values, values_target - CLIP_EPS, values_target + CLIP_EPS) - values_target)**2) * gen_mask # [B, G]
+        critic_loss = max(LV1.mean(), LV2.mean())
+
         # clipped PPO objective
-        ratios = torch.exp(batch_log_probs - old_log_probs)  # [B]
+        ratios = torch.exp(token_log_probs - old_log_probs)  # [B]
         clipped_ratios = torch.clamp(ratios, 1 - CLIP_EPS, 1 + CLIP_EPS)  # typical clip_eps = 0.2
 
-        actor_loss_batches = -torch.min(ratios * advantages, clipped_ratios * advantages)
-        actor_loss = actor_loss_batches.mean()
-
+        actor_loss_batches = torch.min(ratios * advantages, clipped_ratios * advantages) * gen_mask
+        actor_loss = - actor_loss_batches.mean()
+        
+        total_loss = actor_loss + (0.5 * critic_loss)
+        
         # update actor
-        actor_optimizer.zero_grad()
-        actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(adv_model.parameters(), 1.0)
-        actor_optimizer.step()
+        ppo_optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        ppo_optimizer.step()
+        scheduler.step()
+
      
         # calc batch averages for logging
         batch_mean_advantage = advantages.mean()
         avg_reward = rewards.mean()
-        avg_tox_reward = tox.mean()
+        avg_tox_reward = tox_sum / BATCH_SIZE
         #avg_kl_penalty = total_kl_penalty / BATCH_SIZE
         logging.info(f"[{batch}] avg_reward={avg_reward:.4f}, batch_mean_advantage={batch_mean_advantage:.4f}, avg_actor_loss={actor_loss.item():.4f}, avg_critic_loss={critic_loss.item():.4f}")
         
@@ -308,15 +336,18 @@ for batch in tqdm(range(NUM_BATCHES)):
             "avg_toxicity_reward": avg_tox_reward,
             #"avg_kl_penalty": avg_kl_penalty,
         })
-
+        
+        # update old model for next batch
+        old_actor.load_state_dict(model.base_model.state_dict())
+        
         # dev score used by astprompter:  dev_score = sum(rewards)/len(rewards) / average rewards
         if avg_reward > avg_r_best:
             avg_r_best = avg_reward
-            #torch.save(critic.state_dict(), f"perez_models/critic_best_batch{batch}.pt")
+            #torch.save(critic.state_dict()w, f"perez_models/critic_best_batch{batch}.pt")
             saveModel(
-                adv_model,
+                model.base_model,
                 adv_tokenizer,
-                f"perez_ppo/adv_best",
+                f"perez_ppo_new/adv_best",
                 extra_metadata={"avg_reward": avg_reward, "batch": batch, "batch_mean_advantage": batch_mean_advantage, "actor_loss": actor_loss.item(), "critic_loss": critic_loss.item()}
             )    
 
@@ -325,9 +356,9 @@ for batch in tqdm(range(NUM_BATCHES)):
             # save the model every 100 batches
             #torch.save(critic.state_dict(), f"perez_models/critic_checkpoint_critic_batch{batch}.pt")
             saveModel(
-                adv_model,
+                model.base_model,
                 adv_tokenizer,
-                f"perez_ppo/adv_checkpoint_batch{batch}",
+                f"perez_ppo_new/adv_checkpoint_batch{batch}",
                 extra_metadata={"avg_reward": avg_reward, "batch": batch, "batch_mean_advantage": batch_mean_advantage, "actor_loss": actor_loss.item(), "critic_loss": critic_loss.item()}
             )
         
@@ -336,5 +367,5 @@ for batch in tqdm(range(NUM_BATCHES)):
         torch.cuda.empty_cache()
 wandb.finish()
 # Save the final model
-torch.save(adv_model.state_dict(), "perez_ppo/adv_final.pt")
+torch.save(model.base_model.state_dict(), "perez_ppo_new/adv_final.pt")
 #torch.save(critic.state_dict(),"perez_models/critic_best.pt")

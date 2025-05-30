@@ -1,5 +1,7 @@
 import os
 import json
+import torch
+import torch.nn as nn
 
 def saveModel(model, tokenizer, save_dir, extra_metadata=None):
     """
@@ -18,7 +20,41 @@ def saveModel(model, tokenizer, save_dir, extra_metadata=None):
     
     # Save tokenizer (this adds vocab.json, merges.txt, tokenizer_config.json, etc.)
     tokenizer.save_pretrained(save_dir)
-    
+
+def whiten(values, shift_mean=True):
+    mean, var = torch.mean(values), torch.var(values, unbiased=False)
+    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
+    if not shift_mean:
+        whitened += mean
+    return whitened
+
+
+def gaeAndVt(rewards, values):
+ 
+    B, T = rewards.shape
+    device = rewards.device
+    advantages = torch.zeros_like(rewards).to(device)
+    last_gae = 0
+    gamma = 1.0 # perez and openai paper
+    lam = 0.95 # openai paper
+
+    # calc GAE in reversed order
+    for t in reversed(range(T)):
+        if t == T - 1: # if at last timeste, next val is 0
+            next_value = 0
+        else:
+            next_value = values[:, t + 1]
+        delta = rewards[:, t] + gamma * next_value - values[:, t]
+        last_gae = delta + gamma * lam * last_gae
+        advantages[:, t] = last_gae
+
+    returns = advantages + values
+
+    # whiten advantages (with shifted mean)
+    #advantages = whiten(advantages, shift_mean=True)
+
+    return advantages, returns
+
     # Save any additional metadata (optional)
     # if extra_metadata is not None:
     #     with open(os.path.join(save_dir, "meta.json"), 'w') as f:
