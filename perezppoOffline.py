@@ -40,7 +40,7 @@ NUM_BATCHES = NUM_STEPS // BATCH_SIZE # run same number training steps as astpro
 CLIP_EPS = 0.2
 TEMPERATURE = 1.0
 warmup_steps = int(0.1 * NUM_STEPS) 
-NUM_EPOCHS = 4
+NUM_EPOCHS = 2
 NUM_MINIBATCHES = 1 # following huggingface re-imp
 MB_SIZE = BATCH_SIZE // NUM_MINIBATCHES
 VF_COEF = 0.1 # follow hugging face re-imp
@@ -49,7 +49,7 @@ VF_COEF = 0.1 # follow hugging face re-imp
 # Set up wandb
 wandb.init(
     project="perez-training",
-    name=f"perez_run_ppo_lowerKLPen",
+    name=f"perez_ppo_lowKL_multiUpdates",
     config={
         "model_name": model_name,
         "learning_rate": LEARNING_RATE,
@@ -199,8 +199,8 @@ for batch in tqdm(range(NUM_BATCHES)):
         full_attention_mask = torch.cat([attention_mask, gen_mask], dim=1)
         #print("full mask", full_attention_mask) # left padded false for shorter prompts
 
-        
-        adv_logits, values = model(outputs.sequences, full_attention_mask)
+        # this is where the gradients come in
+        adv_logits, values = model(outputs.sequences.detach(), full_attention_mask)
         
         # Get reference logits (on GPU 1)
         with torch.no_grad():
@@ -226,7 +226,7 @@ for batch in tqdm(range(NUM_BATCHES)):
         token_log_probs = adv_log_probs.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1) # [B, G] 
         token_log_probs = token_log_probs * gen_mask
         
-        ref_token__log_probs = ref_log_probs.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1) # [B, G]
+        ref_token_log_probs = ref_log_probs.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1) # [B, G]
         ref_token_log_probs = ref_token_log_probs * gen_mask
         
         kl_divs = token_log_probs - ref_token_log_probs # [B, G] - per token KL divergence
@@ -295,52 +295,80 @@ for batch in tqdm(range(NUM_BATCHES)):
         
         # calc GAE advantage and target values
         advantages, values_target = gaeAndVt(rewards, values) # [B, G] - whitened advantages and target values
-        # print("advantages shape", advantages.shape) # [B, G] / [8, 24]
-        # print("values_target shape", values_target.shape) # [B, G] / [8, 24]
-        # values_target is 
-        advantages = advantages * gen_mask
-        returns = values_target * gen_mask
+        
+        # trying minibatch training like openai/huggingface re-imp
+        miniActorLoss = []
+        miniCriticLoss = []
+        
+        indices = torch.arange(BATCH_SIZE)
 
+        model.train()  
+        advantages = advantages.detach()
+        values_target = values_target.detach()
+        rewards = rewards.detach()
+        gen_mask = gen_mask.to(actor_device).detach()  # [B, G] - mask for generated tokens
+        old_log_probs = old_log_probs.to(actor_device).detach()  # [B, G] - log probs from old model
         
-        ## calc clipped surrogate loss for actor and critic
-        LV1 = ((values - values_target)**2) * gen_mask  # [B, G]
-        LV2 = ((torch.clamp(values, values_target - CLIP_EPS, values_target + CLIP_EPS) - values_target)**2) * gen_mask # [B, G]
-        critic_loss = 0.5 * max(LV1.mean(), LV2.mean())
+        # each epoch updates model gradients multiple times
+        for epoch in range(NUM_EPOCHS):
+            shuffled = indices[torch.randperm(BATCH_SIZE)]  # Shuffle the indices
 
-        # clipped PPO objective
-        ratios = torch.exp(token_log_probs - old_log_probs)  # [B]
-        clipped_ratios = torch.clamp(ratios, 1 - CLIP_EPS, 1 + CLIP_EPS)  # typical clip_eps = 0.2
+            # each minibatch updates model gradients once with a subset of the batch data
+            for i in range(NUM_MINIBATCHES): # mince only one minibatch, just use og values from batch
+                # have to recalc log_probs for the minibatch
+                mb_adv_logits, mb_values = model(outputs.sequences.detach(), full_attention_mask)
+        
+                # slice the prompt off all of these [B, P+G] -> [B, G]
+                mb_adv_logits = mb_adv_logits[:, start:, :]  # slice off prompt logits, [B, G, vocab_size]
+                mb_values = mb_values[:, start:]  # slice off prompt values, [B, G]
+        
+                # whiten values (normalization)
+                mb_adv_log_probs = F.log_softmax(mb_adv_logits, dim=-1) # [MB_SIZE, G, vocab_size]
+                mb_token_log_probs = mb_adv_log_probs.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1) # [B, G] 
+                mb_log_probs = mb_token_log_probs * gen_mask
 
-        actor_loss_batches = torch.min(ratios * advantages, clipped_ratios * advantages) * gen_mask
-        actor_loss = - actor_loss_batches.mean()
-        
-        total_loss = actor_loss + (VF_COEF * critic_loss)
-        
-        # update actor
-        ppo_optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        ppo_optimizer.step()
-        scheduler.step()
-        
+                # Critic loss
+                valid_positions = gen_mask.sum()
+                LV1 = (((mb_values - values_target)**2) * gen_mask).sum() / valid_positions
+                LV2 = (((torch.clamp(mb_values, values_target - CLIP_EPS, values_target + CLIP_EPS) - values_target)**2) * gen_mask).sum() / valid_positions
+                critic_loss = 0.5 * torch.max(LV1, LV2)
+                
+                # Actor loss
+                mb_ratios = torch.exp(mb_log_probs - old_log_probs)
+                mb_clipped_ratios = torch.clamp(mb_ratios, 1 - CLIP_EPS, 1 + CLIP_EPS)
+                mb_actor_loss_batches = torch.min(mb_ratios * advantages, mb_clipped_ratios * advantages) * gen_mask
+                mb_actor_loss = - (mb_actor_loss_batches.sum() / gen_mask.sum())
+                miniActorLoss.append(mb_actor_loss.item())
+                miniCriticLoss.append(critic_loss.item())
+
+                total_loss = mb_actor_loss + (VF_COEF * critic_loss)
+
+                # Update
+                ppo_optimizer.zero_grad()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                ppo_optimizer.step()
+                print("updated!")
+
+
      
         # calc batch averages for logging
         batch_mean_advantage = advantages.mean()
         avg_reward = rewards.mean()
         avg_tox_reward = tox_sum / BATCH_SIZE
         avg_kl_penalty = kl_divs.mean().item()
-        logging.info(f"[{batch}] avg_reward={avg_reward:.4f}, batch_mean_advantage={batch_mean_advantage:.4f}, avg_actor_loss={actor_loss.item():.4f}, avg_critic_loss={critic_loss.item():.4f}")
+        avg_actor_loss = sum(miniActorLoss) / len(miniActorLoss)
+        avg_critic_loss = sum(miniCriticLoss) / len(miniCriticLoss)
+        logging.info(f"[{batch}] avg_reward={avg_reward:.4f}, batch_mean_advantage={batch_mean_advantage:.4f}, avg_actor_loss={avg_actor_loss:.4f}, avg_critic_loss={avg_critic_loss:.4f}")
         
         wandb.log({
             "avg_reward": avg_reward,
             "batch_mean_advantage": batch_mean_advantage,
-            "avg_actor_loss": actor_loss.item(),
-            "avg_critic_loss": critic_loss.item(),
             "batch": batch,
             "avg_toxicity_reward": avg_tox_reward,
-            # "avg_actor_loss_minibatch": sum(miniActorLoss) / len(miniActorLoss),
-            # "avg_critic_loss_minibatch": sum(miniCriticLoss) / len(miniCriticLoss)
-            "avg_kl_penalty": avg_kl_penalty,
+            "avg_actor_loss_minibatch": avg_actor_loss,
+            "avg_critic_loss_minibatch": avg_critic_loss,
+            "avg_kl_div": avg_kl_penalty
         })
         
         # update old model for next batch
@@ -353,10 +381,10 @@ for batch in tqdm(range(NUM_BATCHES)):
             saveModel(
                 model.base_model,
                 adv_tokenizer,
-                f"perez_ppo_lowerKLPen/adv_best",
-                extra_metadata={"avg_reward": avg_reward, "batch": batch, "batch_mean_advantage": batch_mean_advantage, "actor_loss": actor_loss.item(), "critic_loss": critic_loss.item()}
+                f"perez_ppo_multi/adv_best",
+                extra_metadata={"avg_reward": avg_reward, "batch": batch, "batch_mean_advantage": batch_mean_advantage, "actor_loss": avg_actor_loss, "critic_loss": avg_critic_loss}
             )    
-        
+
         # save every number of steps just save a checkpoint 
         # end of one epoch, should loop back to start of training
         torch.cuda.empty_cache()

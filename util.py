@@ -55,14 +55,6 @@ def gaeAndVt(rewards, values):
 
     return advantages, returns
 
-    # Save any additional metadata (optional)
-    # if extra_metadata is not None:
-    #     with open(os.path.join(save_dir, "meta.json"), 'w') as f:
-    #         json.dump(extra_metadata, f, indent=4)
-    
-
-
-
 # follow perez's use of popart for the value head
 # PopArt class wraps the critic's value head with PopArt normalization
 # class PopArt(nn.Module):
