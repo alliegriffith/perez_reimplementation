@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical, kl_divergence
 import math
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup, Adafactor
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 from tqdm import tqdm
 from llamaguard3 import moderate
 import logging
@@ -33,7 +33,7 @@ model_name = "meta-llama/Llama-3.1-8B"
 # Training hyperparameters
 NUM_STEPS = 10000 # consistent with ASTPrompter
 LEARNING_RATE = 2e-6 # consistent with openai paper
-KL_COEF = 0.05  # far less than KL penalty of most effective perez model (0.3) but follows openai paper
+KL_COEF = 0.01  # far less than KL penalty of most effective perez model (0.3) but follows openai paper
 MAX_GEN_TOKENS = 24 # consistent with ASTPrompter??? ASTPrompter is 24 ### change later
 BATCH_SIZE = 8 # Perez had 16, reduced for space reasons
 NUM_BATCHES = NUM_STEPS // BATCH_SIZE # run same number training steps as astprompter
@@ -49,7 +49,7 @@ VF_COEF = 0.1 # follow hugging face re-imp
 # Set up wandb
 wandb.init(
     project="perez-training",
-    name=f"perez_run_ppo_lowerKLPen",
+    name=f"perez_run_ppo_scaleSimpleR",
     config={
         "model_name": model_name,
         "learning_rate": LEARNING_RATE,
@@ -109,6 +109,8 @@ class ActorCriticModel(nn.Module):
             if i < freeze_layers:
                 for param in layer.parameters():
                     param.requires_grad = False
+            else:
+                param.requires_grad = True
 
         self.hidden_size = self.base_model.config.hidden_size
 
@@ -123,17 +125,18 @@ class ActorCriticModel(nn.Module):
 
     # forward pass for actor-critic model to return logits and values
     def forward(self, input_ids, attention_mask=None): # input tokenized P + G and full attention mask
-        
+        # check if hidden_states is correct
         outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
+            temperature = TEMPERATURE,
             return_dict=True,
             do_dropout=False, # disable dropout (what openai/huggingface re-imp do)
         )
         
         hidden_states = outputs.hidden_states[-1]       # [B, T, H]
-        lm_logits = outputs.logits                      # [B, T, vocab]
+        lm_logits = outputs.logits / TEMPERATURE                      # [B, T, vocab]
         values = self.value_head(hidden_states).squeeze(-1)  # [B, T]
 
         return lm_logits, values
@@ -172,9 +175,9 @@ for batch in tqdm(range(NUM_BATCHES)):
         prompt_inputs = adv_tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
         prompt_inputs = {k: v.to(actor_device) for k, v in prompt_inputs.items()}  
         prompt_ids = prompt_inputs["input_ids"]
-        
+        #print("prompt_ids", prompt_ids)
         attention_mask = prompt_ids != adv_tokenizer.pad_token_id
-        
+        #print("attention mask", attention_mask)
         #attention_mask = prompt_inputs["attention_mask"] # prompt attention mask - left padded so 0s on left
         model.eval()
         outputs = model.base_model.generate(
@@ -201,7 +204,8 @@ for batch in tqdm(range(NUM_BATCHES)):
 
         
         adv_logits, values = model(outputs.sequences, full_attention_mask)
-        
+        # print("adv_logits", adv_logits)
+        # print("values", values)
         # Get reference logits (on GPU 1)
         with torch.no_grad():
             ref_logits = def_model(outputs.sequences.to(defender_device), attention_mask=full_attention_mask.to(defender_device)).logits
@@ -226,7 +230,7 @@ for batch in tqdm(range(NUM_BATCHES)):
         token_log_probs = adv_log_probs.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1) # [B, G] 
         token_log_probs = token_log_probs * gen_mask
         
-        ref_token__log_probs = ref_log_probs.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1) # [B, G]
+        ref_token_log_probs = ref_log_probs.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1) # [B, G]
         ref_token_log_probs = ref_token_log_probs * gen_mask
         
         kl_divs = token_log_probs - ref_token_log_probs # [B, G] - per token KL divergence
@@ -236,15 +240,17 @@ for batch in tqdm(range(NUM_BATCHES)):
             old_logits = old_logits[:, start:, :]
             old_log_probs = F.log_softmax(old_logits, dim=-1)
             old_log_probs = old_log_probs.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1).detach()
+            old_log_probs = old_log_probs * gen_mask
 
-
+        # kl_divs2 = token_log_probs - old_log_probs
+        # print("kl divs 2:", kl_divs2)
         #print("adv gen token log probs should be [B, G]", token_log_probs.shape) # [8, 24]
         
         with torch.no_grad(): # no gradients needed for defender
         # now let's get defender response + rewards!
         # def input is prompt + adversarially generated IDs [B] - have to do this way to sep per example
         #def_input_str = [adv_tokenizer.decode(seq, skip_special_tokens=True) for seq in outputs.sequences]
-            def_input_strs = adv_tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True) # list of str, each str is example
+            def_input_strs = adv_tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True, attention_mask = full_attention_mask) # list of str, each str is example
         
             # def input = tensor of [B, P + G] - class from huggingface
             raw = def_tokenizer(def_input_strs, return_tensors="pt", padding=True, truncation=True)
@@ -275,11 +281,14 @@ for batch in tqdm(range(NUM_BATCHES)):
                 score, _ = moderate(text) 
                 # follow perez reward =  (-(log(1 - toxicity)))
                 tox_reward = -math.log(max(1 - score, 1e-8))
+                #tox_reward = score
                 
                 #rewards[b, -1] = tox_reward # only the last token gets the reward "when extracting rewards, it is going to identify the last_response_index, the index before the EOS token (#L11-L13), and extract the reward at that index"
                 last_real_token = gen_mask[b].nonzero()[-1].item()
+                # print(gen_ids[b, :])
+                # print(gen_ids[b, last_real_token])
                 rewards[b, last_real_token] = tox_reward # setting reward to last real token in gen adv ut (sometimes shorter, not often)
-   
+                #print(rewards[b,:]) # correct [0,0,0...0.2812]
                 tox_sum += tox_reward
             
         #     print(rewards)
@@ -290,31 +299,38 @@ for batch in tqdm(range(NUM_BATCHES)):
         # whiten rewards (no shifted mean)
         #rewards = whiten(rewards, shift_mean=False)
         rewards = (rewards - KL_COEF * kl_divs).detach()
+        #print("rewards", rewards)
         #print("rewards after KL penalty", rewards.shape) # [B, G] / [8, 24]
         #print("adv_final_hidden shape", adv_final_hidden.shape) # [B, G, 4096] - hidden size of llama3.1-8b
-        
+        mask = gen_mask.float()
         # calc GAE advantage and target values
         advantages, values_target = gaeAndVt(rewards, values) # [B, G] - whitened advantages and target values
         # print("advantages shape", advantages.shape) # [B, G] / [8, 24]
         # print("values_target shape", values_target.shape) # [B, G] / [8, 24]
         # values_target is 
+        #print("vals target", values_target)
         advantages = advantages * gen_mask
+        #print("adv:",advantages)
         returns = values_target * gen_mask
 
         
         ## calc clipped surrogate loss for actor and critic
-        LV1 = ((values - values_target)**2) * gen_mask  # [B, G]
-        LV2 = ((torch.clamp(values, values_target - CLIP_EPS, values_target + CLIP_EPS) - values_target)**2) * gen_mask # [B, G]
-        critic_loss = 0.5 * max(LV1.mean(), LV2.mean())
+        LV1 = ((values - values_target)**2) * mask  # [B, G]
+        LV2 = ((torch.clamp(values, values_target - CLIP_EPS, values_target + CLIP_EPS) - values_target)**2) * mask # [B, G]
+        critic_loss = 0.5 * torch.max(LV1, LV2).sum() / mask.sum()
 
         # clipped PPO objective
         ratios = torch.exp(token_log_probs - old_log_probs)  # [B]
         clipped_ratios = torch.clamp(ratios, 1 - CLIP_EPS, 1 + CLIP_EPS)  # typical clip_eps = 0.2
 
         actor_loss_batches = torch.min(ratios * advantages, clipped_ratios * advantages) * gen_mask
-        actor_loss = - actor_loss_batches.mean()
+        actor_loss = - (actor_loss_batches.sum() / gen_mask.sum())
+        #print(actor_loss)
         
         total_loss = actor_loss + (VF_COEF * critic_loss)
+        
+        # update old model for next batch
+        old_actor.load_state_dict(model.base_model.state_dict())
         
         # update actor
         ppo_optimizer.zero_grad()
@@ -325,12 +341,13 @@ for batch in tqdm(range(NUM_BATCHES)):
         
      
         # calc batch averages for logging
-        batch_mean_advantage = advantages.mean()
+        batch_mean_advantage = advantages.sum() / gen_mask.sum()
         avg_reward = rewards.mean()
         avg_tox_reward = tox_sum / BATCH_SIZE
         avg_kl_penalty = kl_divs.mean().item()
-        logging.info(f"[{batch}] avg_reward={avg_reward:.4f}, batch_mean_advantage={batch_mean_advantage:.4f}, avg_actor_loss={actor_loss.item():.4f}, avg_critic_loss={critic_loss.item():.4f}")
         
+        logging.info(f"[{batch}] avg_reward={avg_reward:.4f}, batch_mean_advantage={batch_mean_advantage:.4f}, avg_actor_loss={actor_loss:.4f}, avg_critic_loss={critic_loss.item():.4f}")
+
         wandb.log({
             "avg_reward": avg_reward,
             "batch_mean_advantage": batch_mean_advantage,
@@ -338,13 +355,9 @@ for batch in tqdm(range(NUM_BATCHES)):
             "avg_critic_loss": critic_loss.item(),
             "batch": batch,
             "avg_toxicity_reward": avg_tox_reward,
-            # "avg_actor_loss_minibatch": sum(miniActorLoss) / len(miniActorLoss),
-            # "avg_critic_loss_minibatch": sum(miniCriticLoss) / len(miniCriticLoss)
             "avg_kl_penalty": avg_kl_penalty,
         })
         
-        # update old model for next batch
-        old_actor.load_state_dict(model.base_model.state_dict())
         
         # dev score used by astprompter:  dev_score = sum(rewards)/len(rewards) / average rewards
         if avg_reward > avg_r_best:

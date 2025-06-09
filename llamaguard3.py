@@ -8,7 +8,7 @@ import numpy as np
 from accelerate.inference import prepare_pippy
 from accelerate import infer_auto_device_map
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:1") # defender device
 # Model configuration
 model_id = "meta-llama/Llama-Guard-3-8B"
 # quantization_config = BitsAndBytesConfig(load_in_8bit=True)  # Use 4-bit quantization for lower memory if needed
@@ -21,7 +21,9 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 # device_map = infer_auto_device_map(model, max_memory={0: "10GiB", 1: "10GiB"})
 
 # use the device map above
-model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, device_map="auto")
+model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+for param in model.parameters():
+    param.requires_grad = False # freezing llamaguard bc only want to update critic head
 
 model.eval()
 
@@ -34,7 +36,7 @@ unsafe_id = tokenizer.convert_tokens_to_ids("unsafe")
 
 # this function returns a continous toxicity score as well as the 
 # exact toxicity label (safe/unsafe + hazard category) given by Llama Guard 3
-def moderate(utterance):
+def moderate(utterance, criticCall = False):
     chat = [
         {"role": "user", "content": "Hello!"},
         {"role": "assistant", "content": utterance}
@@ -56,7 +58,14 @@ def moderate(utterance):
 
     # make the model score the sequences
     safe_seq_scored = model(safe_seq).logits
-    unsafe_seq_scored = model(unsafe_seq).logits
+    unsafeModel = model(unsafe_seq)
+    unsafe_seq_scored = unsafeModel.logits
+    
+    # if criticCall is True, we return the final hidden state of the model given the unsafe sequence
+    if criticCall:
+        last_token = unsafe_seq.shape[1] - 1
+        final_repr = unsafeModel.hidden_states[-1][:, last_token, :] # returning final hidden state of final token in sequence
+        return final_repr
 
     # and then compute the relavent probabilities
     probs_safe = safe_seq_scored[0][input_ids.size(-1)]
